@@ -48,10 +48,34 @@ def dump(dbpath, output, tables, all, exclude):
     conn = sqlite_utils.Database(dbpath)
     excluded = set(exclude)
     requested_tables = set(tables)
+
+    def name_matches(left, right):
+        return bool(
+            conn.conn.execute("select ? = ? collate nocase", (left, right)).fetchone()[
+                0
+            ]
+        )
+
+    excluded_sequence = any(name_matches(name, "sqlite_sequence") for name in excluded)
+
+    def is_excluded(name):
+        return any(name_matches(name, excluded_name) for excluded_name in excluded)
+
+    internal_requested = any(
+        name_matches(name, "sqlite_sequence") for name in requested_tables
+    )
     if all:
-        tables = set(conn.table_names()) - excluded - {"sqlite_sequence"}
+        tables = {
+            name
+            for name in conn.table_names()
+            if not name_matches(name, "sqlite_sequence") and not is_excluded(name)
+        }
     else:
-        tables = requested_tables - excluded - {"sqlite_sequence"}
+        tables = {
+            name
+            for name in requested_tables
+            if not name_matches(name, "sqlite_sequence") and not is_excluded(name)
+        }
     # SQLite compares ASCII identifiers case-insensitively. Use the database's
     # spelling for sequence matching and for metadata, while leaving Unicode
     # identifiers distinct just as SQLite does.
@@ -90,10 +114,10 @@ def dump(dbpath, output, tables, all, exclude):
     # only include counters for tables selected by this dump operation.
     # Querying sqlite_sequence for named tables lets AUTOINCREMENT selections
     # carry their counters without creating a sequence file for ordinary tables.
-    sequence_requested = bool(tables) or "sqlite_sequence" in requested_tables
+    sequence_requested = bool(tables) or internal_requested
     if (
         sequence_requested
-        and "sqlite_sequence" not in excluded
+        and not excluded_sequence
         and "sqlite_sequence" in conn.table_names()
     ):
         sequence_rows = [
@@ -102,7 +126,7 @@ def dump(dbpath, output, tables, all, exclude):
                 "select name, seq from sqlite_sequence"
             ).fetchall()
             if row[0] in sequence_tables
-            or ("sqlite_sequence" in requested_tables and row[0] not in excluded)
+            or (internal_requested and not is_excluded(row[0]))
         ]
         if sequence_rows:
             with (output / "sqlite_sequence.ndjson").open("w") as fp:
@@ -118,6 +142,20 @@ def dump(dbpath, output, tables, all, exclude):
                     indent=4,
                 )
             )
+        else:
+            for filename in ("sqlite_sequence.metadata.json", "sqlite_sequence.ndjson"):
+                stale = output / filename
+                if stale.exists():
+                    stale.unlink()
+    elif (
+        excluded_sequence
+        or not sequence_requested
+        or "sqlite_sequence" not in conn.table_names()
+    ):
+        for filename in ("sqlite_sequence.metadata.json", "sqlite_sequence.ndjson"):
+            stale = output / filename
+            if stale.exists():
+                stale.unlink()
 
 
 @cli.command()
@@ -140,23 +178,64 @@ def load(dbpath, directory, replace):
     """
     db = sqlite_utils.Database(dbpath)
     directory = pathlib.Path(directory)
-    metadatas = directory.glob("*.metadata.json")
-    sequence_rows = []
-    loaded_tables = set()
+    metadatas = list(directory.glob("*.metadata.json"))
+    metadata_infos = []
+    sequence_rows = {}
+
+    def sequence_key(name):
+        for existing_name in sequence_rows:
+            same_name = db.conn.execute(
+                "select ? = ? collate nocase", (name, existing_name)
+            ).fetchone()[0]
+            if same_name:
+                return existing_name
+        return name
+
     for metadata in metadatas:
         info = json.loads(metadata.read_text())
+        if info["name"] != "sqlite_sequence":
+            metadata_infos.append((metadata, info))
+            continue
+        columns = info.get("columns")
+        if (
+            not isinstance(columns, list)
+            or "name" not in columns
+            or "seq" not in columns
+        ):
+            raise click.ClickException("Invalid sqlite_sequence metadata columns")
+        ndjson = metadata.parent / metadata.stem.replace(".metadata", ".ndjson")
+        positions = {column: index for index, column in enumerate(columns)}
+        for line_number, line in enumerate(ndjson.open(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, list) or len(row) != len(columns):
+                raise click.ClickException(
+                    "Invalid sqlite_sequence row at line {}".format(line_number)
+                )
+            name, seq = row[positions["name"]], row[positions["seq"]]
+            if (
+                not isinstance(name, str)
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+            ):
+                raise click.ClickException(
+                    "sqlite_sequence rows require text names and integer seq values"
+                )
+            if seq < -(2**63) or seq > 2**63 - 1:
+                raise click.ClickException(
+                    "sqlite_sequence seq is outside signed 64-bit range"
+                )
+            key = sequence_key(name)
+            if key in sequence_rows and sequence_rows[key] != seq:
+                raise click.ClickException(
+                    "Conflicting sqlite_sequence values for {!r}".format(name)
+                )
+            sequence_rows[key] = seq
+    loaded_tables = set()
+    for metadata, info in metadata_infos:
         columns = info["columns"]
         schema = info["schema"]
-        if info["name"] == "sqlite_sequence":
-            ndjson = metadata.parent / metadata.stem.replace(".metadata", ".ndjson")
-            positions = {column: index for index, column in enumerate(columns)}
-            for line in ndjson.open():
-                if line.strip():
-                    row = json.loads(line)
-                    sequence_rows.append(
-                        (row[positions["name"]], row[positions["seq"]])
-                    )
-            continue
         if db[info["name"]].exists() and replace:
             db[info["name"]].drop()
         try:
@@ -185,14 +264,25 @@ def load(dbpath, directory, replace):
     # first avoids duplicates in old or hand-edited exports.
     if sequence_rows:
         with db.conn:
-            for name, seq in sequence_rows:
-                if name in loaded_tables:
+            for name, seq in sequence_rows.items():
+                actual_name = next(
+                    (
+                        loaded_name
+                        for loaded_name in loaded_tables
+                        if db.conn.execute(
+                            "select ? = ? collate nocase",
+                            (name, loaded_name),
+                        ).fetchone()[0]
+                    ),
+                    None,
+                )
+                if actual_name is not None:
                     db.conn.execute(
-                        "DELETE FROM sqlite_sequence WHERE name = ?", (name,)
+                        "DELETE FROM sqlite_sequence WHERE name = ?", (actual_name,)
                     )
                     db.conn.execute(
                         "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
-                        (name, seq),
+                        (actual_name, seq),
                     )
 
 

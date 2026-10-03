@@ -127,10 +127,22 @@ def test_autoincrement_dump_load_preserves_deleted_and_empty_history(tmpdir):
         ["empty history", 1],
         ["odd name", 3],
     ]
+    ordinary_conn = sqlite3.connect(source)
+    ordinary_conn.execute("create table ordinary (value text)")
+    ordinary_conn.commit()
+    ordinary_conn.close()
+    result = CliRunner().invoke(cli.cli, ["dump", source, str(output_dir), "ordinary"])
+    assert result.exit_code == 0, result.output
+    assert not (output_dir / "sqlite_sequence.metadata.json").exists()
+    assert not (output_dir / "sqlite_sequence.ndjson").exists()
+
+    # Recreate the counter dump for the restore assertions below.
+    result = CliRunner().invoke(cli.cli, ["dump", source, str(output_dir), "--all"])
+    assert result.exit_code == 0, result.output
     excluded_output = tmpdir / "excluded-sequence"
     result = CliRunner().invoke(
         cli.cli,
-        ["dump", source, str(excluded_output), "--all", "--exclude", "sqlite_sequence"],
+        ["dump", source, str(excluded_output), "--all", "--exclude", "SQLITE_SEQUENCE"],
     )
     assert result.exit_code == 0, result.output
     assert not (excluded_output / "sqlite_sequence.metadata.json").exists()
@@ -336,3 +348,52 @@ def test_sequence_only_export_is_safe_noop(tmpdir):
         cli.cli, ["load", str(tmpdir / "noop.db"), str(directory)]
     )
     assert result.exit_code == 0, result.output
+
+
+def test_invalid_sequence_payload_is_rejected_before_table_changes(tmpdir):
+    source = str(tmpdir / "source.db")
+    conn = sqlite3.connect(source)
+    conn.execute("create table selected (id integer primary key autoincrement)")
+    conn.execute("insert into selected default values")
+    conn.commit()
+    conn.close()
+    directory = tmpdir / "invalid"
+    assert (
+        CliRunner()
+        .invoke(cli.cli, ["dump", source, str(directory), "selected"])
+        .exit_code
+        == 0
+    )
+    (directory / "sqlite_sequence.ndjson").write_text('["selected", "bad"]\n', "utf-8")
+    restored = str(tmpdir / "restored.db")
+    result = CliRunner().invoke(cli.cli, ["load", restored, str(directory)])
+    assert result.exit_code == 1
+    assert "integer seq values" in result.output
+    assert (
+        not sqlite3.connect(restored)
+        .execute("select 1 from sqlite_master where name = 'selected'")
+        .fetchone()
+    )
+
+
+def test_conflicting_sequence_duplicates_are_rejected(tmpdir):
+    directory = tmpdir / "conflict"
+    directory.mkdir()
+    (directory / "sqlite_sequence.metadata.json").write_text(
+        json.dumps(
+            {
+                "name": "sqlite_sequence",
+                "columns": ["name", "seq"],
+                "schema": "CREATE TABLE sqlite_sequence(name,seq)",
+            }
+        ),
+        "utf-8",
+    )
+    (directory / "sqlite_sequence.ndjson").write_text(
+        '["AuditLog", 1]\n["auditlog", 2]\n', "utf-8"
+    )
+    result = CliRunner().invoke(
+        cli.cli, ["load", str(tmpdir / "conflict.db"), str(directory)]
+    )
+    assert result.exit_code == 1
+    assert "Conflicting sqlite_sequence" in result.output
