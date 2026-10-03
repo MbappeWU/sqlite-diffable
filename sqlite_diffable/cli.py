@@ -236,8 +236,13 @@ def load(dbpath, directory, replace):
     for metadata, info in metadata_infos:
         columns = info["columns"]
         schema = info["schema"]
-        if db[info["name"]].exists() and replace:
-            db[info["name"]].drop()
+        existing_name = db.conn.execute(
+            "select name from sqlite_master "
+            "where type in ('table', 'view') and name = ? collate nocase",
+            (info["name"],),
+        ).fetchone()
+        if existing_name and replace:
+            db[existing_name[0]].drop()
         try:
             db.execute(schema)
         except sqlite3.OperationalError as ex:
@@ -252,13 +257,14 @@ def load(dbpath, directory, replace):
             for line in ndjson.open()
             if line.strip()
         )
-        db[info["name"]].insert_all(rows)
         actual_name = db.conn.execute(
             "select name from sqlite_master "
             "where type in ('table', 'view') and name = ? collate nocase",
             (info["name"],),
         ).fetchone()
-        loaded_tables.add(actual_name[0] if actual_name else info["name"])
+        insert_name = actual_name[0] if actual_name else info["name"]
+        db[insert_name].insert_all(rows)
+        loaded_tables.add(insert_name)
 
     # Restore counters only after all ordinary tables and rows exist. DELETE
     # first avoids duplicates in old or hand-edited exports.

@@ -261,6 +261,27 @@ def test_autoincrement_mixed_case_alias_and_unicode_names(tmpdir):
     assert sorted(
         json.loads(line) for line in (output_dir / "sqlite_sequence.ndjson").open()
     ) == [["AuditLog", 1], ["Ä", 1]]
+    restored = str(tmpdir / "restored.db")
+    result = CliRunner().invoke(cli.cli, ["load", restored, str(output_dir)])
+    assert result.exit_code == 0, result.output
+    restored_conn = sqlite3.connect(restored)
+    restored_conn.execute('insert into "AuditLog" default values')
+    assert restored_conn.execute("select last_insert_rowid()").fetchone()[0] == 2
+    restored_conn.close()
+
+    # The metadata keeps the requested lower-case spelling, so --replace must
+    # still find and replace the actual mixed-case SQLite table.
+    (output_dir / "auditlog.ndjson").write_text("[1]\n", "utf-8")
+    result = CliRunner().invoke(
+        cli.cli, ["load", restored, str(output_dir), "--replace"]
+    )
+    assert result.exit_code == 0, result.output
+    assert (
+        sqlite3.connect(restored)
+        .execute('select count(*) from "AuditLog"')
+        .fetchone()[0]
+        == 1
+    )
 
 
 def test_legacy_full_sequence_and_missing_counter_exports_are_safe(tmpdir):
