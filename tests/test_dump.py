@@ -20,10 +20,15 @@ def test_dump(one_table_db, tmpdir):
     assert [[1, "Stacey"], [2, "Tilda"], [3, "Bartek"]] == [
         json.loads(line) for line in ndjson.open()
     ]
+    actual_schema = (
+        sqlite3.connect(one_table_db)
+        .execute("select sql from sqlite_master where name = 'one_table'")
+        .fetchone()[0]
+    )
     assert {
         "name": "one_table",
         "columns": ["id", "name"],
-        "schema": "CREATE TABLE [one_table] (\n   [id] INTEGER PRIMARY KEY,\n   [name] TEXT\n)",
+        "schema": actual_schema,
     } == json.load(metadata)
 
 
@@ -122,27 +127,28 @@ def test_autoincrement_dump_load_preserves_deleted_and_empty_history(tmpdir):
         ["empty history", 1],
         ["odd name", 3],
     ]
+    excluded_output = tmpdir / "excluded-sequence"
+    result = CliRunner().invoke(
+        cli.cli,
+        ["dump", source, str(excluded_output), "--all", "--exclude", "sqlite_sequence"],
+    )
+    assert result.exit_code == 0, result.output
+    assert not (excluded_output / "sqlite_sequence.metadata.json").exists()
 
     restored = str(tmpdir / "restored.db")
     result = CliRunner().invoke(cli.cli, ["load", restored, str(output_dir)])
     assert result.exit_code == 0, result.output
     restored_conn = sqlite3.connect(restored)
-    assert (
-        restored_conn.execute(
-            'INSERT INTO "odd name" (value) VALUES (?) RETURNING id', ("next",)
-        ).fetchone()[0]
-        == 4
-    )
-    assert (
-        restored_conn.execute(
-            'INSERT INTO "empty history" (value) VALUES (?) RETURNING id', ("first",)
-        ).fetchone()[0]
-        == 2
-    )
+    restored_conn.execute('INSERT INTO "odd name" (value) VALUES (?)', ("next",))
+    assert restored_conn.execute("select last_insert_rowid()").fetchone()[0] == 4
+    restored_conn.execute('INSERT INTO "empty history" (value) VALUES (?)', ("first",))
+    assert restored_conn.execute("select last_insert_rowid()").fetchone()[0] == 2
     restored_conn.close()
 
 
-def test_autoincrement_sequence_selection_exclude_replace_and_metadata_order(tmpdir):
+def test_autoincrement_sequence_selection_exclude_replace_and_metadata_order(
+    tmpdir, monkeypatch
+):
     source = str(tmpdir / "source.db")
     conn = sqlite3.connect(source)
     conn.executescript("""
@@ -206,6 +212,21 @@ def test_autoincrement_sequence_selection_exclude_replace_and_metadata_order(tmp
         ("unrelated", 1),
     ]
 
+    # Exercise the opposite metadata iteration order as well.
+    original_glob = cli.pathlib.Path.glob
+
+    def reverse_glob(path, pattern):
+        return list(reversed(list(original_glob(path, pattern))))
+
+    monkeypatch.setattr(cli.pathlib.Path, "glob", reverse_glob)
+    reversed_restored = str(tmpdir / "reversed-restored.db")
+    result = CliRunner().invoke(cli.cli, ["load", reversed_restored, str(ordered_dir)])
+    assert result.exit_code == 0, result.output
+    reversed_db = sqlite_utils.Database(reversed_restored)
+    assert reversed_db.conn.execute(
+        "select name, seq from sqlite_sequence"
+    ).fetchall() == [("selected", 2)]
+
 
 def test_autoincrement_mixed_case_alias_and_unicode_names(tmpdir):
     source = str(tmpdir / "source.db")
@@ -228,3 +249,90 @@ def test_autoincrement_mixed_case_alias_and_unicode_names(tmpdir):
     assert sorted(
         json.loads(line) for line in (output_dir / "sqlite_sequence.ndjson").open()
     ) == [["AuditLog", 1], ["Ä", 1]]
+
+
+def test_legacy_full_sequence_and_missing_counter_exports_are_safe(tmpdir):
+    source = str(tmpdir / "source.db")
+    conn = sqlite3.connect(source)
+    conn.executescript("""
+        CREATE TABLE selected (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+        CREATE TABLE unrelated (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+        INSERT INTO selected (value) VALUES ('one'), ('two');
+        INSERT INTO unrelated (value) VALUES ('keep');
+        DELETE FROM selected WHERE id = 2;
+        """)
+    conn.commit()
+    conn.close()
+    dump_dir = tmpdir / "dump"
+    assert (
+        CliRunner()
+        .invoke(cli.cli, ["dump", source, str(dump_dir), "selected"])
+        .exit_code
+        == 0
+    )
+
+    # A pre-existing legacy sequence file can contain counters for tables not
+    # present in this load. Those rows must not alter the destination.
+    sequence_metadata = dump_dir / "sqlite_sequence.metadata.json"
+    sequence_metadata.write_text(
+        json.dumps(
+            {
+                "name": "sqlite_sequence",
+                "columns": ["name", "seq"],
+                "schema": "CREATE TABLE sqlite_sequence(name,seq)",
+            }
+        ),
+        "utf-8",
+    )
+    (dump_dir / "sqlite_sequence.ndjson").write_text(
+        '["selected", 2]\n["unrelated", 99]\n', "utf-8"
+    )
+    restored = str(tmpdir / "restored.db")
+    existing = sqlite3.connect(restored)
+    existing.execute(
+        "CREATE TABLE unrelated (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)"
+    )
+    existing.execute("INSERT INTO unrelated (value) VALUES ('keep')")
+    existing.commit()
+    existing.close()
+    result = CliRunner().invoke(cli.cli, ["load", restored, str(dump_dir)])
+    assert result.exit_code == 0, result.output
+    restored_conn = sqlite3.connect(restored)
+    assert restored_conn.execute(
+        "select name, seq from sqlite_sequence order by name"
+    ).fetchall() == [
+        ("selected", 2),
+        ("unrelated", 1),
+    ]
+    restored_conn.close()
+
+    # Removing sequence files models an older export: available rows load and
+    # SQLite chooses the next ID from the surviving rows.
+    no_counter = tmpdir / "no-counter"
+    no_counter.mkdir()
+    for path in pathlib.Path(str(dump_dir)).iterdir():
+        if "sqlite_sequence" not in path.name:
+            (pathlib.Path(str(no_counter)) / path.name).write_bytes(path.read_bytes())
+    old_restored = str(tmpdir / "old-restored.db")
+    result = CliRunner().invoke(cli.cli, ["load", old_restored, str(no_counter)])
+    assert result.exit_code == 0, result.output
+
+
+def test_sequence_only_export_is_safe_noop(tmpdir):
+    directory = tmpdir / "sequence-only"
+    directory.mkdir()
+    (directory / "sqlite_sequence.metadata.json").write_text(
+        json.dumps(
+            {
+                "name": "sqlite_sequence",
+                "columns": ["name", "seq"],
+                "schema": "CREATE TABLE sqlite_sequence(name,seq)",
+            }
+        ),
+        "utf-8",
+    )
+    (directory / "sqlite_sequence.ndjson").write_text('["not-loaded", 4]\n', "utf-8")
+    result = CliRunner().invoke(
+        cli.cli, ["load", str(tmpdir / "noop.db"), str(directory)]
+    )
+    assert result.exit_code == 0, result.output

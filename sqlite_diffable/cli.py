@@ -55,22 +55,23 @@ def dump(dbpath, output, tables, all, exclude):
     # SQLite compares ASCII identifiers case-insensitively. Use the database's
     # spelling for sequence matching and for metadata, while leaving Unicode
     # identifiers distinct just as SQLite does.
-    actual_tables = set()
+    table_identities = {}
     for table in tables:
         actual = conn.conn.execute(
             "select name from sqlite_master "
             "where type in ('table', 'view') and name = ? collate nocase",
             (table,),
         ).fetchone()
-        actual_tables.add(actual[0] if actual else table)
-    tables = actual_tables
+        table_identities[table] = actual[0] if actual else table
+    sequence_tables = set(table_identities.values())
     for table in tables:
+        actual_table = table_identities[table]
         tablename = table.replace("/", "")
         filepath = output / "{}.ndjson".format(tablename)
         metapath = output / "{}.metadata.json".format(tablename)
         # Dump rows to filepath
         with filepath.open("w") as fp:
-            for row in conn[table].rows:
+            for row in conn[actual_table].rows:
                 fp.write(json.dumps(list(row.values()), default=repr) + "\n")
             fp.close()
         # Dump out metadata
@@ -78,8 +79,8 @@ def dump(dbpath, output, tables, all, exclude):
             json.dumps(
                 {
                     "name": table,
-                    "columns": [c.name for c in conn[table].columns],
-                    "schema": conn[table].schema,
+                    "columns": [c.name for c in conn[actual_table].columns],
+                    "schema": conn[actual_table].schema,
                 },
                 indent=4,
             )
@@ -100,7 +101,7 @@ def dump(dbpath, output, tables, all, exclude):
             for row in conn.conn.execute(
                 "select name, seq from sqlite_sequence"
             ).fetchall()
-            if row[0] in tables
+            if row[0] in sequence_tables
             or ("sqlite_sequence" in requested_tables and row[0] not in excluded)
         ]
         if sequence_rows:
@@ -173,7 +174,12 @@ def load(dbpath, directory, replace):
             if line.strip()
         )
         db[info["name"]].insert_all(rows)
-        loaded_tables.add(info["name"])
+        actual_name = db.conn.execute(
+            "select name from sqlite_master "
+            "where type in ('table', 'view') and name = ? collate nocase",
+            (info["name"],),
+        ).fetchone()
+        loaded_tables.add(actual_name[0] if actual_name else info["name"])
 
     # Restore counters only after all ordinary tables and rows exist. DELETE
     # first avoids duplicates in old or hand-edited exports.
