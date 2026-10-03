@@ -42,6 +42,19 @@ You can replace those tables (dropping them before restoring them) using the `--
 ```bash
 sqlite-diffable load restored.db dump/ --replace
 ```
+
+Tables created with SQLite's `AUTOINCREMENT` keyword use an internal
+`sqlite_sequence` table to remember the highest ID ever allocated. Dumps made
+with `--all` or with a named AUTOINCREMENT table include the applicable
+sequence rows, and `load` restores those counters after the ordinary tables
+and rows. This preserves the next generated ID even when the highest existing
+row was deleted, or when a table is currently empty. The internal table is
+never created or dropped by the loader, and counters for excluded or otherwise
+unloaded tables are left unchanged.
+
+Older dumps without `sqlite_sequence` data still load their available tables
+and rows; they cannot restore history that was not recorded in the dump.
+
 ## Converting to JSON objects
 
 Table rows are stored in the `.ndjson` files as newline-delimited JSON arrays, like this:

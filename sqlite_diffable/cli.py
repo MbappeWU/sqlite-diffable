@@ -46,10 +46,24 @@ def dump(dbpath, output, tables, all, exclude):
     output = pathlib.Path(output)
     output.mkdir(exist_ok=True)
     conn = sqlite_utils.Database(dbpath)
+    excluded = set(exclude)
+    requested_tables = set(tables)
     if all:
-        tables = set(conn.table_names()) - set(exclude)
+        tables = set(conn.table_names()) - excluded - {"sqlite_sequence"}
     else:
-        tables = set(tables) - set(exclude)
+        tables = requested_tables - excluded - {"sqlite_sequence"}
+    # SQLite compares ASCII identifiers case-insensitively. Use the database's
+    # spelling for sequence matching and for metadata, while leaving Unicode
+    # identifiers distinct just as SQLite does.
+    actual_tables = set()
+    for table in tables:
+        actual = conn.conn.execute(
+            "select name from sqlite_master "
+            "where type in ('table', 'view') and name = ? collate nocase",
+            (table,),
+        ).fetchone()
+        actual_tables.add(actual[0] if actual else table)
+    tables = actual_tables
     for table in tables:
         tablename = table.replace("/", "")
         filepath = output / "{}.ndjson".format(tablename)
@@ -70,6 +84,39 @@ def dump(dbpath, output, tables, all, exclude):
                 indent=4,
             )
         )
+
+    # sqlite_sequence is an internal table. Keep its existing dump format, but
+    # only include counters for tables selected by this dump operation.
+    # Querying sqlite_sequence for named tables lets AUTOINCREMENT selections
+    # carry their counters without creating a sequence file for ordinary tables.
+    sequence_requested = bool(tables) or "sqlite_sequence" in requested_tables
+    if (
+        sequence_requested
+        and "sqlite_sequence" not in excluded
+        and "sqlite_sequence" in conn.table_names()
+    ):
+        sequence_rows = [
+            row
+            for row in conn.conn.execute(
+                "select name, seq from sqlite_sequence"
+            ).fetchall()
+            if row[0] in tables
+            or ("sqlite_sequence" in requested_tables and row[0] not in excluded)
+        ]
+        if sequence_rows:
+            with (output / "sqlite_sequence.ndjson").open("w") as fp:
+                for name, seq in sequence_rows:
+                    fp.write(json.dumps([name, seq], default=repr) + "\n")
+            (output / "sqlite_sequence.metadata.json").write_text(
+                json.dumps(
+                    {
+                        "name": "sqlite_sequence",
+                        "columns": ["name", "seq"],
+                        "schema": "CREATE TABLE sqlite_sequence(name,seq)",
+                    },
+                    indent=4,
+                )
+            )
 
 
 @cli.command()
@@ -93,10 +140,22 @@ def load(dbpath, directory, replace):
     db = sqlite_utils.Database(dbpath)
     directory = pathlib.Path(directory)
     metadatas = directory.glob("*.metadata.json")
+    sequence_rows = []
+    loaded_tables = set()
     for metadata in metadatas:
         info = json.loads(metadata.read_text())
         columns = info["columns"]
         schema = info["schema"]
+        if info["name"] == "sqlite_sequence":
+            ndjson = metadata.parent / metadata.stem.replace(".metadata", ".ndjson")
+            positions = {column: index for index, column in enumerate(columns)}
+            for line in ndjson.open():
+                if line.strip():
+                    row = json.loads(line)
+                    sequence_rows.append(
+                        (row[positions["name"]], row[positions["seq"]])
+                    )
+            continue
         if db[info["name"]].exists() and replace:
             db[info["name"]].drop()
         try:
@@ -114,6 +173,21 @@ def load(dbpath, directory, replace):
             if line.strip()
         )
         db[info["name"]].insert_all(rows)
+        loaded_tables.add(info["name"])
+
+    # Restore counters only after all ordinary tables and rows exist. DELETE
+    # first avoids duplicates in old or hand-edited exports.
+    if sequence_rows:
+        with db.conn:
+            for name, seq in sequence_rows:
+                if name in loaded_tables:
+                    db.conn.execute(
+                        "DELETE FROM sqlite_sequence WHERE name = ?", (name,)
+                    )
+                    db.conn.execute(
+                        "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                        (name, seq),
+                    )
 
 
 @cli.command()
